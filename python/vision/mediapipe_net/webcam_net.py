@@ -26,14 +26,8 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-import mediapipe as mp
-import tensorflow as tf
 
-# ─── Elérési utak ────────────────────────────────────────────────────────────
-_HERE       = Path(__file__).parent
-MODEL_PATH  = _HERE / "mp_hand_gesture"
-NAMES_PATH  = _HERE / "gesture.names"
-# ─────────────────────────────────────────────────────────────────────────────
+from mp_mlp_net import MediaPipeMLP  # BaseGestureNet implementáció – itt cserélhető
 
 # ─── Beállítások ─────────────────────────────────────────────────────────────
 TCP_HOST    = "localhost"
@@ -84,53 +78,6 @@ def send_command(sock: socket.socket, cmd: str):
     sock.sendall((cmd + "\n").encode("utf-8"))
 
 
-# ─── Modell ───────────────────────────────────────────────────────────────────
-
-def load_gesture_model():
-    print(f"[CAM] Modell betöltése: {MODEL_PATH}")
-    model = tf.keras.models.load_model(str(MODEL_PATH))
-    print("[CAM] Modell betöltve.")
-    return model
-
-
-def load_class_names() -> list[str]:
-    names = NAMES_PATH.read_text(encoding="utf-8").strip().split("\n")
-    names = [n.strip().lower() for n in names]
-    print(f"[CAM] Gesture osztályok: {names}")
-    return names
-
-
-def predict_gesture(model, class_names, hands_solution, frame):
-    h, w, _ = frame.shape
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    rgb.flags.writeable = False
-    result = hands_solution.process(rgb)
-
-    gesture_name = None
-    confidence   = 0.0
-
-    if result.multi_hand_landmarks:
-        for hand_lms in result.multi_hand_landmarks:
-            landmarks = []
-            for lm in hand_lms.landmark:
-                landmarks.append([int(lm.x * w), int(lm.y * h)])
-
-            mp.solutions.drawing_utils.draw_landmarks(
-                frame, hand_lms,
-                mp.solutions.hands.HAND_CONNECTIONS,
-            )
-
-            prediction   = model.predict([landmarks], verbose=0)
-            class_id     = int(np.argmax(prediction))
-            confidence   = float(prediction[0][class_id])
-            gesture_name = class_names[class_id]
-
-            label = f"{gesture_name}  ({confidence*100:.0f}%)"
-            cv2.putText(frame, label, (10, 50),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2, cv2.LINE_AA)
-            break  # csak az első kéz
-
-    return gesture_name, confidence, frame
 
 
 # ─── Főprogram ────────────────────────────────────────────────────────────────
@@ -139,8 +86,9 @@ def main():
     args        = parse_args()
     show_preview = SHOW_PREVIEW and not args.no_preview
 
-    model       = load_gesture_model()
-    class_names = load_class_names()
+    # ── Modell betöltése – itt cseréld le más implementációra ─────────────────
+    net = MediaPipeMLP()
+    # ──────────────────────────────────────────────────────────────────────────
 
     # Kamera megnyitása
     cap = cv2.VideoCapture(args.camera)
@@ -159,12 +107,6 @@ def main():
             print(f"[CAM] TCP nem elérhető ({e}), 2 mp múlva újrapróbálom...")
             time.sleep(2.0)
 
-    mp_hands = mp.solutions.hands.Hands(
-        max_num_hands=1,
-        min_detection_confidence=0.7,
-        min_tracking_confidence=0.5,
-    )
-
     last_command: str | None = None
     last_sent_ts: float      = 0.0
 
@@ -180,7 +122,7 @@ def main():
 
             frame = cv2.flip(frame, 1)  # tükrözés – természetesebb kézkövetés
 
-            gesture, conf, annotated = predict_gesture(model, class_names, mp_hands, frame)
+            gesture, conf, annotated = net.predict_annotated(frame)
 
             if gesture is not None:
                 cmd = GESTURE_MAP.get(gesture.lower())
@@ -210,7 +152,7 @@ def main():
     except KeyboardInterrupt:
         print("\n[CAM] Leállítás...")
     finally:
-        mp_hands.close()
+        net.close()
         cap.release()
         if show_preview:
             cv2.destroyAllWindows()

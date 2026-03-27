@@ -27,15 +27,9 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-import mediapipe as mp
-import tensorflow as tf
 import zmq
 
-# ─── Elérési utak (script melletti könyvtárhoz képest) ───────────────────────
-_HERE = Path(__file__).parent
-MODEL_PATH  = _HERE / "mp_hand_gesture"
-NAMES_PATH  = _HERE / "gesture.names"
-# ─────────────────────────────────────────────────────────────────────────────
+from mp_mlp_net import MediaPipeMLP  # BaseGestureNet implementáció – itt cserélhető
 
 # ─── Beállítások ─────────────────────────────────────────────────────────────
 ZMQ_HOST    = "localhost"
@@ -130,61 +124,6 @@ def send_command(sock: socket.socket, cmd: str):
 
 # ─── Modell + MediaPipe ───────────────────────────────────────────────────────
 
-def load_gesture_model():
-    print(f"[NET] Modell betöltése: {MODEL_PATH}")
-    model = tf.keras.models.load_model(str(MODEL_PATH))
-    print("[NET] Modell betöltve.")
-    return model
-
-
-def load_class_names() -> list[str]:
-    names = NAMES_PATH.read_text(encoding="utf-8").strip().split("\n")
-    names = [n.strip().lower() for n in names]
-    print(f"[NET] Gesture osztályok: {names}")
-    return names
-
-
-def predict_gesture(
-    model,
-    class_names: list[str],
-    hands_solution,
-    frame: np.ndarray,
-) -> tuple[str | None, float, np.ndarray]:
-    """
-    Visszaadja (gesture_name, confidence, annotalt_frame).
-    Ha nincs kez: (None, 0.0, frame).
-    """
-    h, w, _ = frame.shape
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    rgb.flags.writeable = False
-    result = hands_solution.process(rgb)
-
-    gesture_name = None
-    confidence = 0.0
-
-    if result.multi_hand_landmarks:
-        for hand_lms in result.multi_hand_landmarks:
-            landmarks = []
-            for lm in hand_lms.landmark:
-                landmarks.append([int(lm.x * w), int(lm.y * h)])
-
-            mp.solutions.drawing_utils.draw_landmarks(
-                frame, hand_lms,
-                mp.solutions.hands.HAND_CONNECTIONS,
-            )
-
-            prediction = model.predict([landmarks], verbose=0)
-            class_id   = int(np.argmax(prediction))
-            conf       = float(prediction[0][class_id])
-            gesture_name = class_names[class_id]
-            confidence = conf
-
-            label = f"{gesture_name}  ({conf*100:.0f}%)"
-            cv2.putText(frame, label, (10, 50),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2, cv2.LINE_AA)
-            break   # csak az első kéz
-
-    return gesture_name, confidence, frame
 
 
 # ─── Főprogram ───────────────────────────────────────────────────────────────
@@ -193,9 +132,9 @@ def main():
     args = parse_args()
     show_preview = SHOW_PREVIEW and not args.no_preview
 
-    # Modell és nevek betöltése
-    model      = load_gesture_model()
-    class_names = load_class_names()
+    # ── Modell betöltése – itt cseréld le más implementációra ─────────────────
+    net = MediaPipeMLP()
+    # ──────────────────────────────────────────────────────────────────────────
 
     # ZMQ feliratkozás
     zmq_ctx, sub = make_zmq_sub(args.zmq_host, args.zmq_port)
@@ -209,13 +148,6 @@ def main():
         except Exception as e:
             print(f"[NET] TCP nem elérhető ({e}), 2 mp múlva újrapróbálom...")
             time.sleep(2.0)
-
-    # MediaPipe Hands
-    mp_hands = mp.solutions.hands.Hands(
-        max_num_hands=1,
-        min_detection_confidence=0.7,
-        min_tracking_confidence=0.5,
-    )
 
     last_command: str | None = None
     last_sent_ts: float = 0.0
@@ -231,7 +163,7 @@ def main():
                 continue
 
             # ── Gesture felismeres ─────────────────────────────────────────
-            gesture, conf, annotated = predict_gesture(model, class_names, mp_hands, frame)
+            gesture, conf, annotated = net.predict_annotated(frame)
 
             if gesture is not None:
                 cmd = GESTURE_MAP.get(gesture.lower())
@@ -262,7 +194,7 @@ def main():
     except KeyboardInterrupt:
         print("\n[NET] Leállítás...")
     finally:
-        mp_hands.close()
+        net.close()
         if show_preview:
             cv2.destroyAllWindows()
         sub.close()
