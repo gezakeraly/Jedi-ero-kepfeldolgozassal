@@ -1,0 +1,73 @@
+{
+  "SettingsVersion": 2.0,
+  "SimMode": "SkidVehicle",
+  "LogMessagesVisible": true,
+  "InitialInstanceSegmentation": true,
+  "EngineSound": false,
+  "DefaultVehiclePossess": false,
+  "CameraDefaults": {
+    "CaptureSettings": [
+      {
+        "ImageType": 0,
+        "Width": 224,
+        "Height": 224,
+        "FOV_Degrees": 135
+      }
+    ]
+  },
+  "Vehicles": {
+    "Car1": {
+      "X": 0,
+      "Y": -3,
+      "Z": 0,
+      "Yaw": 90,
+      "VehicleType": "CPHusky",
+      "DefaultVehicleState": "Armed",
+      "AutoCreate": true,
+      "EnableCollisionPassthrogh": false,
+      "EnableCollisions": true,
+      "AllowAPIAlways": true,
+      "EnableTrace": false,
+      "Cameras": {
+        "MyCamera1": {
+          "CaptureSettings": [
+            {
+              "ImageType": 0,
+              "Width": 1280,
+              "Height": 960,
+              "FOV_Degrees": 100
+            },
+            {
+              "ImageType": 5,
+              "Width": 1280,
+              "Height": 960,
+              "FOV_Degrees": 100
+            }
+          ],
+          "X": 1.9,
+          "Y": 0,
+          "Z": -1.5,
+          "Pitch": 0.0,
+          "Roll": 0.0,
+          "Yaw": 0
+        },
+        "GestureCamera": {
+          "CaptureSettings": [
+            {
+              "ImageType": 0,
+              "Width": 1280,
+              "Height": 960,
+              "FOV_Degrees": 80
+            }
+          ],
+          "X": 1.9,
+          "Y": 0,
+          "Z": -1.0,
+          "Pitch": 0.0,
+          "Roll": 0.0,
+          "Yaw": 0
+        }
+      }
+    }
+  }
+}

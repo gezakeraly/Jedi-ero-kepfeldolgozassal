@@ -1,0 +1,71 @@
+# ─── Unreal Engine ────────────────────────────────────────────────────────────
+Binaries/
+Build/
+DerivedDataCache/
+Intermediate/
+Saved/
+Packaged/
+Builds/
+Content/
+Plugins/
+
+# UE5 generált fájlok
+*.sln
+*_BuiltData.uasset
+*.xcworkspace
+*.kdev4
+*.kdev/
+*.pro
+*.workspace
+*CodeCompletionFoldersTxt
+*CodeLitePreProcessor.txt
+*.pri
+CMakeLists.txt
+Makefile
+
+# UE5 binary asset fájlok (nagy méret)
+*.uasset
+*.umap
+*.uproject
+
+# ─── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtuális környezetek
+.venv*/
+venv*/
+env*/
+
+# ─── ML modellek ──────────────────────────────────────────────────────────────
+# A betanított modell fájlokat ne tároljuk gitben (nagy méret)
+# Kivéve: gesture.names és requirements.txt megmarad
+python/vision/mediapipe_net/mp_hand_gesture/variables/
+python/vision/mediapipe_net/mp_hand_gesture/assets/
+python/vision/mediapipe_net/mp_hand_gesture/*.pb
+python/vision/mediapipe_net/data.pickle
+
+# ─── Captures (generált képek) ────────────────────────────────────────────────
+captures/rgb/*
+captures/seg/*
+captures/depth/*
+captures/depth_preview/*
+# .gitkeep fájlok megmaradnak a mappastruktúrához
+!captures/**/.gitkeep
+
+# ─── Logok ────────────────────────────────────────────────────────────────────
+*.log
+net_stdout.log
+net_stderr.log
+
+# ─── OS / IDE ─────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.vsconfig
+*.code-workspace
+
+# ─── Régi backup settings ─────────────────────────────────────────────────────
+configs/settings01.json
+configs/settings02.json
+configs/settingsG.json

@@ -1,0 +1,13 @@
+# ─── MediaPipe Net ──────────────────────────────────────────────────────────
+# Python: 3.8.8  (system: C:\Users\szebe\AppData\Local\Programs\Python\Python38\python.exe)
+# FONTOS: ezek a pontos verziók működnek együtt – ne változtasd!
+# Telepítés: setup_venvs.ps1 -t mediapipe
+#            VAGY: pip install -r requirements.txt
+
+tensorflow==2.5.0
+mediapipe==0.8.3.1
+numpy==1.19.3
+opencv-python==4.5.1.48
+pyzmq
+keras-nightly==2.5.0.dev2021032900
+protobuf==3.20.3

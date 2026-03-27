@@ -1,0 +1,10 @@
+# ─── AirSim oldal (server + car_controller + frame_publisher) ───────────────
+# Python: 3.8.8  (system: C:\Users\szebe\AppData\Local\Programs\Python\Python38\python.exe)
+# Telepítés: setup_venvs.ps1 -t airsim
+#            VAGY: pip install -r requirements_airsim.txt
+
+cosysairsim==3.3.0
+numpy==1.19.3
+opencv-contrib-python==4.12.0.88
+pyzmq
+msgpack==1.1.1
