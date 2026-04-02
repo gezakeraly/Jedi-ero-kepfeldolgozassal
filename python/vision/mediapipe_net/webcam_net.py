@@ -1,17 +1,14 @@
 """
-Webcam Gesture Net – laptop kameráról ismer fel kézjeleket, TCP parancsot küld.
+Webcam Gesture Net – laptop kameráról vezérli a járművet kézgesztusokkal.
 
 Architektúra:
-    [Laptop kamera]  →(OpenCV)→  [ez a script]  →(TCP SENDER)→  tcp_command_server.py
+    [Laptop kamera] →(OpenCV)→ [ez a script] →(TCP SENDER)→ tcp_command_server.py
 
-Gesture → parancs leképezés (megegyezik a mediapipe_net.py-val):
-    thumbs up   → FORWARD
-    thumbs down → BACKWARD
-    peace       → LEFT
-    okay        → RIGHT
-    stop        → STOP
-    fist        → STOP
-    (többi)     → (nincs parancs, az utolsó parancs marad érvényben)
+Állapotgép:
+    INACTIVE ──[✌️ peace]──► ACTIVE ──[👌 okay / kéz eltűnik]──► INACTIVE
+                                │
+                           ☝️ pointing + szög → irányparancs
+                           bármi más          → STOP
 
 Leállítás: Ctrl+C  vagy  'q' billentyű az ablakban
 """
@@ -22,42 +19,28 @@ import socket
 import sys
 import time
 import argparse
-from pathlib import Path
 
 import cv2
 import numpy as np
 
-from mp_mlp_net import MediaPipeMLP  # BaseGestureNet implementáció – itt cserélhető
+from mp_mlp_net import MediaPipeMLP
+from gesture_state_machine import GestureStateMachine
 
-# ─── Beállítások ─────────────────────────────────────────────────────────────
-TCP_HOST    = "localhost"
-TCP_PORT    = 65432
-CAMERA_ID   = 0        # 0 = alapértelmezett laptop kamera; 1, 2... ha több van
-
-GESTURE_MAP: dict[str, str | None] = {
-    "thumbs up":   "FORWARD",
-    "thumbs down": "BACKWARD",
-    "peace":       "LEFT",
-    "okay":        "RIGHT",
-    "stop":        "STOP",
-    "fist":        "STOP",
-    "call me":     None,
-    "rock":        None,
-    "live long":   None,
-    "smile":       None,
-}
-
-RESEND_INTERVAL = 2.0   # ha ugyanaz a parancs, ennyinként ismétli meg
+# ─── Beállítások ──────────────────────────────────────────────────────────────
+TCP_HOST        = "localhost"
+TCP_PORT        = 65432
+CAMERA_ID       = 0        # 0 = alapértelmezett laptop kamera
+RESEND_INTERVAL = 0.5      # ugyanazt a parancsot ennyinként küldi újra (keepalive)
 SHOW_PREVIEW    = True
-# ─────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
 
 
 def parse_args():
     p = argparse.ArgumentParser(description="Webcam gesture net → TCP sender")
-    p.add_argument("--tcp-host",   default=TCP_HOST,  help="TCP Command Server host")
+    p.add_argument("--tcp-host",   default=TCP_HOST)
     p.add_argument("--tcp-port",   type=int, default=TCP_PORT)
-    p.add_argument("--camera",     type=int, default=CAMERA_ID, help="Kamera index (0=laptop)")
-    p.add_argument("--no-preview", action="store_true", help="Ne nyisson ablakot")
+    p.add_argument("--camera",     type=int, default=CAMERA_ID)
+    p.add_argument("--no-preview", action="store_true")
     return p.parse_args()
 
 
@@ -70,85 +53,99 @@ def connect_tcp(host: str, port: int) -> socket.socket:
     ack = sock.recv(64).decode("utf-8", errors="ignore").strip()
     if not ack.startswith("OK"):
         raise RuntimeError(f"TCP handshake hiba: {ack!r}")
-    print(f"[CAM] TCP SENDER csatlakozva: {host}:{port}  ({ack})")
+    print(f"[CAM] TCP SENDER csatlakozva: {host}:{port}")
     return sock
+
+
+def connect_tcp_with_retry(host: str, port: int) -> socket.socket:
+    while True:
+        try:
+            return connect_tcp(host, port)
+        except Exception as e:
+            print(f"[CAM] TCP nem elérhető ({e}), 2 mp múlva újrapróbálom...")
+            time.sleep(2.0)
 
 
 def send_command(sock: socket.socket, cmd: str):
     sock.sendall((cmd + "\n").encode("utf-8"))
 
 
+def try_send(sock: socket.socket, cmd: str, host: str, port: int) -> socket.socket:
+    try:
+        send_command(sock, cmd)
+    except Exception as e:
+        print(f"[CAM] TCP hiba: {e} – újracsatlakozás...")
+        sock.close()
+        sock = connect_tcp(host, port)
+        send_command(sock, cmd)
+    return sock
 
 
 # ─── Főprogram ────────────────────────────────────────────────────────────────
 
+def draw_state(frame: np.ndarray, state: str) -> None:
+    color = (0, 200, 0) if state == "ACTIVE" else (0, 0, 200)
+    cv2.putText(
+        frame, f"SM: {state}",
+        (10, frame.shape[0] - 15),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2,
+    )
+
+
+def run_loop(
+    net, sm: GestureStateMachine,
+    cap, tcp_sock: socket.socket,
+    host: str, port: int,
+    show_preview: bool,
+) -> socket.socket:
+    last_command: str | None = None
+    last_sent_ts: float      = 0.0
+
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            time.sleep(0.05)
+            continue
+
+        gesture, conf, annotated, landmarks, handedness = net.predict_full(cv2.flip(frame, 1))
+        cmd = sm.process(gesture, conf, handedness, landmarks)
+
+        now = time.time()
+        if cmd != last_command or (now - last_sent_ts) >= RESEND_INTERVAL:
+            print(f"[CAM] [{sm.state:8s}] gesture='{gesture or '–'}' → {cmd}")
+            tcp_sock = try_send(tcp_sock, cmd, host, port)
+            last_command = cmd
+            last_sent_ts = now
+
+        if show_preview:
+            draw_state(annotated, sm.state)
+            cv2.imshow("Webcam Gesture", annotated)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+
+    return tcp_sock
+
+
 def main():
-    args        = parse_args()
+    args = parse_args()
     show_preview = SHOW_PREVIEW and not args.no_preview
 
-    # ── Modell betöltése – itt cseréld le más implementációra ─────────────────
     net = MediaPipeMLP()
-    # ──────────────────────────────────────────────────────────────────────────
+    sm  = GestureStateMachine()
 
-    # Kamera megnyitása
     cap = cv2.VideoCapture(args.camera)
     if not cap.isOpened():
         print(f"[CAM] HIBA: Nem sikerült megnyitni a kamerát (index={args.camera})")
         sys.exit(1)
     print(f"[CAM] Kamera megnyitva (index={args.camera})")
 
-    # TCP csatlakozás
-    tcp_sock = None
     print(f"[CAM] TCP csatlakozás: {args.tcp_host}:{args.tcp_port} ...")
-    while tcp_sock is None:
-        try:
-            tcp_sock = connect_tcp(args.tcp_host, args.tcp_port)
-        except Exception as e:
-            print(f"[CAM] TCP nem elérhető ({e}), 2 mp múlva újrapróbálom...")
-            time.sleep(2.0)
-
-    last_command: str | None = None
-    last_sent_ts: float      = 0.0
-
+    tcp_sock = connect_tcp_with_retry(args.tcp_host, args.tcp_port)
     print("[CAM] Futás – Ctrl+C vagy 'q' a leállításhoz")
+    print("[CAM] ✌️  PEACE = bekapcs  |  ☝️  mutató = irány  |  👌  OK = kikapcs")
 
     try:
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                print("[CAM] Nem érkezett kép a kamerától, várok...")
-                time.sleep(0.05)
-                continue
-
-            frame = cv2.flip(frame, 1)  # tükrözés – természetesebb kézkövetés
-
-            gesture, conf, annotated = net.predict_annotated(frame)
-
-            if gesture is not None:
-                cmd = GESTURE_MAP.get(gesture.lower())
-                now = time.time()
-
-                if cmd is not None:
-                    if cmd != last_command or (now - last_sent_ts) >= RESEND_INTERVAL:
-                        try:
-                            send_command(tcp_sock, cmd)
-                            print(f"[CAM] gesture='{gesture}' ({conf*100:.0f}%) -> {cmd}")
-                        except Exception as e:
-                            print(f"[CAM] TCP hiba: {e} - újracsatlakozás...")
-                            tcp_sock.close()
-                            tcp_sock = connect_tcp(args.tcp_host, args.tcp_port)
-                            send_command(tcp_sock, cmd)
-                        last_command = cmd
-                        last_sent_ts = now
-                else:
-                    if gesture.lower() != (last_command or "").lower():
-                        print(f"[CAM] gesture='{gesture}' ({conf*100:.0f}%) -> (nincs parancs)")
-
-            if show_preview:
-                cv2.imshow("Webcam Gesture", annotated)
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    break
-
+        tcp_sock = run_loop(net, sm, cap, tcp_sock, args.tcp_host, args.tcp_port, show_preview)
     except KeyboardInterrupt:
         print("\n[CAM] Leállítás...")
     finally:
@@ -156,8 +153,7 @@ def main():
         cap.release()
         if show_preview:
             cv2.destroyAllWindows()
-        if tcp_sock:
-            tcp_sock.close()
+        tcp_sock.close()
         print("[CAM] Kész.")
 
 

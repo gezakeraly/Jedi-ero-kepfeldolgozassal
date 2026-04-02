@@ -4,14 +4,16 @@ MediaPipe Gesture Net – ZMQ képet fogad, kézjelet ismer fel, TCP parancsot k
 Architektúra:
     frame_publisher.py  →(ZMQ PUB)→  [ez a script]  →(TCP SENDER)→  tcp_command_server.py
 
-Gesture → parancs leképezés (szerkeszthető lent a GESTURE_MAP-ban):
-    thumbs up   → FORWARD
-    thumbs down → BACKWARD
-    peace       → LEFT
-    okay        → RIGHT
-    stop        → STOP
-    fist        → STOP
-    (többi)     → (nincs parancs, az utolsó parancs marad érvényben)
+Állapotgép:
+    INACTIVE ──[✌️ peace]──► ACTIVE ──[👌 okay / kéz eltűnik]──► INACTIVE
+                                │
+                           ☝️ pointing + szög → irányparancs
+                           bármi más          → STOP
+
+Többkamerás támogatás:
+    Ha a frame_publisher több kamerát küld (multipart ZMQ üzenetek),
+    a state machine minden kamera képét feldolgozza.
+    Ha BÁRMELYIK kamera látja az aktív kezet, az ACTIVE állapot megmarad.
 
 Leállítás: Ctrl+C
 """
@@ -23,51 +25,31 @@ import struct
 import sys
 import time
 import argparse
-from pathlib import Path
 
 import cv2
 import numpy as np
 import zmq
 
-from mp_mlp_net import MediaPipeMLP  # BaseGestureNet implementáció – itt cserélhető
+from mp_mlp_net import MediaPipeMLP
+from gesture_state_machine import GestureStateMachine
 
 # ─── Beállítások ─────────────────────────────────────────────────────────────
-ZMQ_HOST    = "localhost"
-ZMQ_PORT    = 5555
-TCP_HOST    = "localhost"
-TCP_PORT    = 65432
-
-# Milyen gesturekre milyen parancs megy ki.
-# A gesture.names-ban lévő sor (kisbetűs) → VALID_COMMANDS egyike vagy None
-GESTURE_MAP: dict[str, str | None] = {
-    "thumbs up":   "FORWARD",
-    "thumbs down": "BACKWARD",
-    "peace":       "LEFT",
-    "okay":        "RIGHT",
-    "stop":        "STOP",
-    "fist":        "STOP",
-    # többi gesture: None → nem küld parancsot (megtartja az előzőt)
-    "call me":     None,
-    "rock":        None,
-    "live long":   None,
-    "smile":       None,
-}
-
-# Debounce: csak akkor küld parancsot, ha változott VAGY ennyi másodperc eltelt
-RESEND_INTERVAL = 2.0   # mp – ha ugyanaz a parancs, ennyinként ismétli meg
-
-# Ablak megjelenítése (True: OpenCV preview; False: headless)
-SHOW_PREVIEW = True
-# ─────────────────────────────────────────────────────────────────────────────
+ZMQ_HOST        = "localhost"
+ZMQ_PORT        = 5555
+TCP_HOST        = "localhost"
+TCP_PORT        = 65432
+RESEND_INTERVAL = 0.5   # mp – ugyanazt a parancsot ennyinként küldi újra (keepalive)
+SHOW_PREVIEW    = True
+# ──────────────────────────────────────────────────────────────────────────────
 
 
 def parse_args():
     p = argparse.ArgumentParser(description="MediaPipe gesture net → TCP sender")
-    p.add_argument("--zmq-host",  default=ZMQ_HOST, help="Frame publisher host")
-    p.add_argument("--zmq-port",  type=int, default=ZMQ_PORT)
-    p.add_argument("--tcp-host",  default=TCP_HOST, help="TCP Command Server host")
-    p.add_argument("--tcp-port",  type=int, default=TCP_PORT)
-    p.add_argument("--no-preview", action="store_true", help="Ne nyisson ablakot")
+    p.add_argument("--zmq-host",   default=ZMQ_HOST)
+    p.add_argument("--zmq-port",   type=int, default=ZMQ_PORT)
+    p.add_argument("--tcp-host",   default=TCP_HOST)
+    p.add_argument("--tcp-port",   type=int, default=TCP_PORT)
+    p.add_argument("--no-preview", action="store_true")
     return p.parse_args()
 
 
@@ -77,31 +59,42 @@ def make_zmq_sub(host: str, port: int) -> tuple[zmq.Context, zmq.Socket]:
     ctx = zmq.Context()
     sub = ctx.socket(zmq.SUB)
     sub.connect(f"tcp://{host}:{port}")
-    sub.setsockopt(zmq.SUBSCRIBE, b"")        # minden topic-ra feliratkozunk
-    sub.setsockopt(zmq.RCVTIMEO, 2000)        # 2 s timeout
-    sub.setsockopt(zmq.RCVHWM, 2)             # max 2 buffered frame
+    sub.setsockopt(zmq.SUBSCRIBE, b"")
+    sub.setsockopt(zmq.RCVTIMEO, 2000)
+    sub.setsockopt(zmq.RCVHWM, 2)
     print(f"[NET] ZMQ SUB csatlakozva: tcp://{host}:{port}")
     return ctx, sub
 
 
-def recv_frame(sub) -> np.ndarray | None:
-    """Fogad egy frame-et ZMQ-bol. Visszaad BGR numpy frame-et vagy None."""
+def recv_frame(sub) -> tuple[str, np.ndarray | None]:
+    """
+    Fogad egy frame-et ZMQ-ból.
+
+    Returns:
+        (camera_name, BGR frame) – siker esetén
+        (camera_name, None)      – dekódolási hiba esetén
+        ("", None)               – timeout esetén
+    """
     try:
-        raw = sub.recv(flags=0)
+        parts = sub.recv_multipart(flags=0)
     except zmq.Again:
-        return None
-    return decode_frame(raw)
+        return "", None
+
+    if len(parts) == 1:
+        camera_name, payload = "default", parts[0]
+    else:
+        camera_name = parts[0].decode("utf-8", errors="ignore")
+        payload     = parts[1]
+
+    return camera_name, _decode_frame(payload)
 
 
-def decode_frame(raw: bytes) -> np.ndarray | None:
-    """ZMQ payload → BGR numpy frame."""
+def _decode_frame(raw: bytes) -> np.ndarray | None:
     if len(raw) < 8:
         return None
-    # w, h = struct.unpack('<II', raw[:8])   # csak ha kell a méret
-    jpg_bytes = raw[8:]
+    jpg_bytes = raw[8:]  # első 8 byte = width/height header
     arr = np.frombuffer(jpg_bytes, dtype=np.uint8)
-    frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    return frame
+    return cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
 
 # ─── TCP ─────────────────────────────────────────────────────────────────────
@@ -109,21 +102,88 @@ def decode_frame(raw: bytes) -> np.ndarray | None:
 def connect_tcp(host: str, port: int) -> socket.socket:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.connect((host, port))
-    # Handshake: SENDER szerepet jelzünk
     sock.sendall(b"ROLE:SENDER\n")
     ack = sock.recv(64).decode("utf-8", errors="ignore").strip()
     if not ack.startswith("OK"):
         raise RuntimeError(f"TCP handshake hiba: {ack!r}")
-    print(f"[NET] TCP SENDER csatlakozva: {host}:{port}  ({ack})")
+    print(f"[NET] TCP SENDER csatlakozva: {host}:{port}")
     return sock
+
+
+def connect_tcp_with_retry(host: str, port: int) -> socket.socket:
+    while True:
+        try:
+            return connect_tcp(host, port)
+        except Exception as e:
+            print(f"[NET] TCP nem elérhető ({e}), 2 mp múlva újrapróbálom...")
+            time.sleep(2.0)
 
 
 def send_command(sock: socket.socket, cmd: str):
     sock.sendall((cmd + "\n").encode("utf-8"))
 
 
-# ─── Modell + MediaPipe ───────────────────────────────────────────────────────
+def try_send(sock: socket.socket, cmd: str, host: str, port: int) -> socket.socket:
+    try:
+        send_command(sock, cmd)
+    except Exception as e:
+        print(f"[NET] TCP hiba: {e} – újracsatlakozás...")
+        sock.close()
+        sock = connect_tcp(host, port)
+        send_command(sock, cmd)
+    return sock
 
+
+# ─── Preview ─────────────────────────────────────────────────────────────────
+
+def draw_state(frame: np.ndarray, state: str, camera: str) -> None:
+    color = (0, 200, 0) if state == "ACTIVE" else (0, 0, 200)
+    cv2.putText(
+        frame, f"SM: {state}  [{camera}]",
+        (10, frame.shape[0] - 15),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2,
+    )
+
+
+def show_frame(annotated: np.ndarray, state: str, camera: str) -> bool:
+    """Kirajzolja a képet. True ha 'q'-val kilépnek."""
+    draw_state(annotated, state, camera)
+    cv2.imshow(f"Gesture – {camera}", annotated)
+    return (cv2.waitKey(1) & 0xFF) == ord('q')
+
+
+# ─── Főciklus ────────────────────────────────────────────────────────────────
+
+def run_loop(
+    net, sm: GestureStateMachine,
+    sub, tcp_sock: socket.socket,
+    host: str, port: int,
+    show_preview: bool,
+) -> socket.socket:
+    last_command: str | None = None
+    last_sent_ts: float      = 0.0
+
+    while True:
+        camera, frame = recv_frame(sub)
+        if frame is None:
+            if camera == "":
+                print("[NET] Nem érkezett frame (timeout), várok...")
+            continue
+
+        gesture, conf, annotated, landmarks, handedness = net.predict_full(frame)
+        cmd = sm.process(gesture, conf, handedness, landmarks)
+
+        now = time.time()
+        if cmd != last_command or (now - last_sent_ts) >= RESEND_INTERVAL:
+            print(f"[NET] [{sm.state:8s}] [{camera}] gesture='{gesture or '–'}' → {cmd}")
+            tcp_sock = try_send(tcp_sock, cmd, host, port)
+            last_command = cmd
+            last_sent_ts = now
+
+        if show_preview and show_frame(annotated, sm.state, camera):
+            break
+
+    return tcp_sock
 
 
 # ─── Főprogram ───────────────────────────────────────────────────────────────
@@ -132,65 +192,18 @@ def main():
     args = parse_args()
     show_preview = SHOW_PREVIEW and not args.no_preview
 
-    # ── Modell betöltése – itt cseréld le más implementációra ─────────────────
     net = MediaPipeMLP()
-    # ──────────────────────────────────────────────────────────────────────────
+    sm  = GestureStateMachine()
 
-    # ZMQ feliratkozás
     zmq_ctx, sub = make_zmq_sub(args.zmq_host, args.zmq_port)
 
-    # TCP csatlakozás (újrapróbálja ha a szerver még nem fut)
-    tcp_sock = None
     print(f"[NET] TCP csatlakozás: {args.tcp_host}:{args.tcp_port} ...")
-    while tcp_sock is None:
-        try:
-            tcp_sock = connect_tcp(args.tcp_host, args.tcp_port)
-        except Exception as e:
-            print(f"[NET] TCP nem elérhető ({e}), 2 mp múlva újrapróbálom...")
-            time.sleep(2.0)
-
-    last_command: str | None = None
-    last_sent_ts: float = 0.0
-
-    print("[NET] Futas - Ctrl+C a leallitashoz")
+    tcp_sock = connect_tcp_with_retry(args.tcp_host, args.tcp_port)
+    print("[NET] Futás – Ctrl+C a leállításhoz")
+    print("[NET] ✌️  PEACE = bekapcs  |  ☝️  mutató = irány  |  👌  OK = kikapcs")
 
     try:
-        while True:
-            # ── Frame fogadas ──────────────────────────────────────────────
-            frame = recv_frame(sub)
-            if frame is None:
-                print("[NET] Nem erkezett frame (timeout), varok...")
-                continue
-
-            # ── Gesture felismeres ─────────────────────────────────────────
-            gesture, conf, annotated = net.predict_annotated(frame)
-
-            if gesture is not None:
-                cmd = GESTURE_MAP.get(gesture.lower())
-                now = time.time()
-
-                if cmd is not None:
-                    if cmd != last_command or (now - last_sent_ts) >= RESEND_INTERVAL:
-                        try:
-                            send_command(tcp_sock, cmd)
-                            print(f"[NET] gesture='{gesture}' ({conf*100:.0f}%) -> {cmd}")
-                        except Exception as e:
-                            print(f"[NET] TCP hiba: {e} - ujracsatlakozas...")
-                            tcp_sock.close()
-                            tcp_sock = connect_tcp(args.tcp_host, args.tcp_port)
-                            send_command(tcp_sock, cmd)
-                        last_command = cmd
-                        last_sent_ts = now
-                else:
-                    if gesture.lower() != (last_command or "").lower():
-                        print(f"[NET] gesture='{gesture}' ({conf*100:.0f}%) -> (nincs parancs)")
-
-            # ── Preview ────────────────────────────────────────────────────
-            if show_preview:
-                cv2.imshow("MediaPipe Gesture", annotated)
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    break
-
+        tcp_sock = run_loop(net, sm, sub, tcp_sock, args.tcp_host, args.tcp_port, show_preview)
     except KeyboardInterrupt:
         print("\n[NET] Leállítás...")
     finally:
@@ -199,8 +212,7 @@ def main():
             cv2.destroyAllWindows()
         sub.close()
         zmq_ctx.term()
-        if tcp_sock:
-            tcp_sock.close()
+        tcp_sock.close()
         print("[NET] Kész.")
 
 

@@ -10,7 +10,7 @@ A rendszer MediaPipe + TensorFlow segítségével ismeri fel a kézjeleket, és 
 ```
 ┌─────────────────┐     ZMQ:5555      ┌──────────────────────┐
 │  frame_pub.py   │ ────────────────► │   mediapipe_net.py   │
-│ (AirSim kamera) │                   │  MediaPipe + TF model │
+│ (AirSim kamera) │                   │  GestureStateMachine  │
 └─────────────────┘                   └──────────┬───────────┘
                                                   │
           ┌───────────────────────────────────────┘  TCP:65432
@@ -34,6 +34,44 @@ A rendszer MediaPipe + TensorFlow segítségével ismeri fel a kézjeleket, és 
 
 ---
 
+## Vezérlési logika — állapotgép
+
+A rendszer állapotgép alapján működik. A jármű csak explicit aktiválás után reagál gesztusokra, és a kéz eltűnésekor automatikusan megáll.
+
+```
+INAKTÍV ──[✌️ PEACE]──► AKTÍV ──[👌 OK / kéz eltűnik]──► INAKTÍV
+                           │
+      ☝️ mutató + szög → irányparancs
+      bármi más         → STOP (autó megáll)
+```
+
+**Szabályok:**
+- Az első detektált PEACE kéz aktivál — a rendszer ezt a kézoldalt (bal/jobb) követi
+- A jármű CSAK mutató ujj gesztus közben mozog — minden más gesztus megállítja
+- Ha az aktív kéz eltűnik a kamera(ák) képéből → automatikusan INAKTÍV
+
+---
+
+## Gesztusok és parancsok
+
+| Gesztus | Állapot | Hatás |
+|---|---|---|
+| ✌️ Peace | INAKTÍV | → AKTÍV (bekapcs) |
+| 👌 OK | AKTÍV | → INAKTÍV (kikapcs) |
+| ☝️ Mutató felfelé | AKTÍV | `FORWARD` |
+| ☝️ Mutató jobb-fel átló | AKTÍV | `FORWARD_RIGHT` |
+| ☝️ Mutató jobb-le átló | AKTÍV | `BACKWARD_RIGHT` |
+| ☝️ Mutató lefelé | AKTÍV | `BACKWARD` |
+| ☝️ Mutató bal-le átló | AKTÍV | `BACKWARD_LEFT` |
+| ☝️ Mutató bal-fel átló | AKTÍV | `FORWARD_LEFT` |
+| ✋ Tenyér / bármi más | AKTÍV | `STOP` |
+| kéz eltűnik | AKTÍV | `STOP` → INAKTÍV |
+
+**Iránydetektálás:** a csukló (landmark 0) → mutatóujj hegy (landmark 8) vektor szögéből,
+6 egyenlő zóna (60°/zóna), geometriailag — nem ML.
+
+---
+
 ## Mappastruktúra
 
 ```
@@ -43,8 +81,8 @@ Blocks_hand_sign/
 │
 ├── python/
 │   ├── airsim/
-│   │   ├── frame_publisher.py # AirSim kamera → ZMQ stream
-│   │   └── environment.py     # AirSim API wrapper (képgyűjtés, scene info)
+│   │   ├── frame_publisher.py # AirSim kamera(ák) → ZMQ stream (multi-cam)
+│   │   └── environment.py     # AirSim API wrapper
 │   │
 │   ├── control/
 │   │   ├── tcp_server.py      # TCP parancs-elosztó szerver
@@ -52,13 +90,15 @@ Blocks_hand_sign/
 │   │   └── keyboard_sender.py # Billentyűzetes vezérlés (alternatíva)
 │   │
 │   ├── vision/
-│   │   ├── mediapipe_net/
-│   │   │   ├── mediapipe_net.py          # AirSim kamera stream → gesztus → TCP
-│   │   │   ├── webcam_net.py             # Laptop kamera → gesztus → TCP
-│   │   │   ├── gesture.names             # 10 gesztus osztály neve
-│   │   │   ├── mp_hand_gesture/          # Betanított TF SavedModel
-│   │   │   └── requirements.txt          # MediaPipe venv függőségek
-│   │   └── hand_demo.py                  # Kézdetekció vizuális demo
+│   │   ├── base_gesture_net.py           # Egységes modell interfész (ABC)
+│   │   └── mediapipe_net/
+│   │       ├── gesture_state_machine.py  # Állapotgép + iránydetektálás
+│   │       ├── mediapipe_net.py          # AirSim ZMQ stream → gesztus → TCP
+│   │       ├── webcam_net.py             # Laptop kamera → gesztus → TCP
+│   │       ├── mp_mlp_net.py             # MediaPipe + TF MLP (baseline modell)
+│   │       ├── gesture.names             # 10 gesztus osztály neve
+│   │       ├── mp_hand_gesture/          # Betanított TF SavedModel
+│   │       └── requirements.txt          # MediaPipe venv függőségek
 │   │
 │   └── requirements_airsim.txt           # AirSim venv függőségek
 │
@@ -73,6 +113,26 @@ Blocks_hand_sign/
 ├── Source/                    # UE5 C++ forrás (AirSim GameMode)
 ├── Config/                    # UE5 projekt konfiguráció (.ini fájlok)
 └── captures/                  # Rögzített képkockák (rgb, seg, depth)
+```
+
+---
+
+## Modell interfész (BaseGestureNet)
+
+Minden gesztusfelismerő modell a `BaseGestureNet` interfészt implementálja:
+
+```python
+class SajatModell(BaseGestureNet):
+    def predict(self, frame: np.ndarray) -> tuple[str | None, float]:
+        ...  # gesture_name | None, confidence
+```
+
+Az állapotgéphez szükséges kiterjesztett interfész (`predict_full`) opcionálisan
+elérhető a MediaPipe-alapú modelleknél — visszaadja a nyers landmarkokat és a kézoldalt is.
+
+Új modell berakása — csak ezt a sort kell cserélni a runner szkriptekben:
+```python
+net = MediaPipeMLP()   # ← pl. TransformerNet() vagy GNNNet()
 ```
 
 ---
@@ -131,6 +191,12 @@ Másold ide a `configs/settings.json` tartalmát, vagy az UE5 Editor
 5. Terminál 4:  .\scripts\start_mediapipe_net.ps1
 ```
 
+**Többkamerás mód** (AirSim 3 kamera):
+```powershell
+# start_publisher.ps1 helyett:
+python python/airsim/frame_publisher.py --cameras GestureCamera_Front GestureCamera_Left GestureCamera_Right
+```
+
 ### Mód 3 — Billentyűzetes vezérlés (teszteléshez)
 
 ```
@@ -142,26 +208,15 @@ Billentyűk: `W` előre · `S` hátra · `A` balra · `D` jobbra · `Space` stop
 
 ---
 
-## Gesztusok és parancsok
-
-| Gesztus | Parancs | Jármű reakció |
-|---|---|---|
-| 👍 Thumbs Up | `FORWARD` | Előre (gáz: 0.6) |
-| 👎 Thumbs Down | `BACKWARD` | Hátra (gáz: -0.6) |
-| ✊ Fist / ✋ Stop | `STOP` | Teljes fék |
-| ✌️ Peace | `LEFT` | Balra kanyar |
-| 👌 Okay | `RIGHT` | Jobbra kanyar |
-
----
-
 ## Kamera konfiguráció (configs/settings.json)
 
 | Kamera | Pozíció | Felbontás | FOV | Célok |
 |---|---|---|---|---|
 | `MyCamera1` | Z=-1.5 (térd) | 1280×960 | 100° | Általános nézet |
-| `GestureCamera` | Z=-1.0 (váll) | 1280×960 | 80° | Gesztusfelismerés |
-
-A kamera a járműhöz rögzített — együtt mozog vele.
+| `GestureCamera` | Z=-1.0 (váll) | 1280×960 | 80° | Gesztusfelismerés (egyetlen kamera) |
+| `GestureCamera_Front` | Z=-1.0 (váll) | 1280×960 | 80° | Gesztusfelismerés (multi-cam, előre) |
+| `GestureCamera_Left` | Z=-1.0, 45° bal | 1280×960 | 80° | Gesztusfelismerés (multi-cam, bal) |
+| `GestureCamera_Right` | Z=-1.0, 45° jobb | 1280×960 | 80° | Gesztusfelismerés (multi-cam, jobb) |
 
 ---
 
@@ -173,13 +228,15 @@ Kézfogás:
   Szerver → Kliens:  "OK:SENDER\n"    vagy  "OK:RECEIVER\n"
 
 Parancsok (szöveges, sorvége-elválasztott):
-  FORWARD · BACKWARD · LEFT · RIGHT · STOP
+  FORWARD · FORWARD_LEFT · FORWARD_RIGHT
+  BACKWARD · BACKWARD_LEFT · BACKWARD_RIGHT
+  STOP
 ```
 
 ## ZMQ frame stream (port 5555)
 
 ```
-Üzenet formátum:
+Üzenet formátum (1 kamera):
   [4 byte width (uint32 LE)] [4 byte height (uint32 LE)] [JPEG bájtok...]
 
 Több kamera esetén multipart:

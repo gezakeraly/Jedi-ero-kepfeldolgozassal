@@ -69,10 +69,10 @@ def apply_command(client: airsim.CarClient, cmd: str, vehicle_name: str):
         controls.manual_gear = 0
 
     elif cmd == "BACKWARD":
-        controls.throttle = -THROTTLE_VAL
+        controls.throttle = THROTTLE_VAL
         controls.steering = 0.0
         controls.brake = 0.0
-        controls.is_manual_gear = False
+        controls.is_manual_gear = True
         controls.manual_gear = -1
 
     elif cmd == "LEFT":
@@ -88,6 +88,34 @@ def apply_command(client: airsim.CarClient, cmd: str, vehicle_name: str):
         controls.brake = 0.0
         controls.is_manual_gear = False
         controls.manual_gear = 0
+
+    elif cmd == "FORWARD_LEFT":
+        controls.throttle = THROTTLE_VAL
+        controls.steering = -STEERING_VAL
+        controls.brake = 0.0
+        controls.is_manual_gear = False
+        controls.manual_gear = 0
+
+    elif cmd == "FORWARD_RIGHT":
+        controls.throttle = THROTTLE_VAL
+        controls.steering = STEERING_VAL
+        controls.brake = 0.0
+        controls.is_manual_gear = False
+        controls.manual_gear = 0
+
+    elif cmd == "BACKWARD_LEFT":
+        controls.throttle = THROTTLE_VAL
+        controls.steering = -STEERING_VAL
+        controls.brake = 0.0
+        controls.is_manual_gear = True
+        controls.manual_gear = -1
+
+    elif cmd == "BACKWARD_RIGHT":
+        controls.throttle = THROTTLE_VAL
+        controls.steering = STEERING_VAL
+        controls.brake = 0.0
+        controls.is_manual_gear = True
+        controls.manual_gear = -1
 
     elif cmd == "STOP":
         controls.throttle = 0.0

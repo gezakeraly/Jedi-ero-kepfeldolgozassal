@@ -66,18 +66,28 @@ class MediaPipeMLP(BaseGestureNet):
 
     def predict(self, frame: np.ndarray) -> tuple[str | None, float]:
         """BaseGestureNet interfész – csak az eredményt adja vissza."""
-        gesture, conf, _ = self._run(frame.copy(), annotate=False)
+        gesture, conf, _, _, _ = self._run(frame.copy(), annotate=False)
         return gesture, conf
 
     def predict_annotated(
         self, frame: np.ndarray
     ) -> tuple[str | None, float, np.ndarray]:
-        """
-        Predict + a kézpontok és gesztus neve rárajzolva.
-        Display és debug célra (a runner szkriptek ezt hívják).
-        """
-        gesture, conf, annotated = self._run(frame.copy(), annotate=True)
+        """Predict + annotált frame. Display / debug célra."""
+        gesture, conf, annotated, _, _ = self._run(frame.copy(), annotate=True)
         return gesture, conf, annotated
+
+    def predict_full(
+        self, frame: np.ndarray
+    ) -> tuple[str | None, float, np.ndarray, object | None, str | None]:
+        """
+        Teljes kimenet az állapotgéphez.
+
+        Returns:
+            (gesture, confidence, annotated_frame, hand_landmarks, handedness)
+            hand_landmarks: mp NormalizedLandmarkList | None
+            handedness:     "Left" | "Right" | None
+        """
+        return self._run(frame.copy(), annotate=True)
 
     def close(self) -> None:
         self._hands.close()
@@ -86,19 +96,20 @@ class MediaPipeMLP(BaseGestureNet):
 
     def _run(
         self, frame: np.ndarray, annotate: bool
-    ) -> tuple[str | None, float, np.ndarray]:
+    ) -> tuple[str | None, float, np.ndarray, object | None, str | None]:
         h, w, _ = frame.shape
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         rgb.flags.writeable = False
         result = self._hands.process(rgb)
 
         if not result.multi_hand_landmarks:
-            return None, 0.0, frame
+            return None, 0.0, frame, None, None
 
-        hand_lms  = result.multi_hand_landmarks[0]
-        landmarks = [[int(lm.x * w), int(lm.y * h)] for lm in hand_lms.landmark]
+        hand_lms   = result.multi_hand_landmarks[0]
+        handedness = result.multi_handedness[0].classification[0].label  # "Left" | "Right"
+        px_lms     = [[int(lm.x * w), int(lm.y * h)] for lm in hand_lms.landmark]
 
-        prediction = self._model.predict([landmarks], verbose=0)
+        prediction = self._model.predict([px_lms], verbose=0)
         class_id   = int(np.argmax(prediction))
         confidence = float(prediction[0][class_id])
         gesture    = self.class_names[class_id]
@@ -112,4 +123,4 @@ class MediaPipeMLP(BaseGestureNet):
                 (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2, cv2.LINE_AA,
             )
 
-        return gesture, confidence, frame
+        return gesture, confidence, frame, hand_lms, handedness
